@@ -245,13 +245,21 @@ FTransform UInstancedSplineMeshComponent::CalcTransformInstance( const float Alp
 
 	return SliceTransform;
 }
-
+#if ENGINE_MAJOR_VERSION == 4
 int32 UInstancedSplineMeshComponent::AddInstance(const FTransform& InstanceTransform)
 {
 	checkf( bValidAddFence, TEXT("Don't call AddInstance(const FTransform& InstanceTransform) on spline mesh components, call AddSplineInstance instead."));
 	
 	return Super::AddInstance(InstanceTransform);
 }
+#else
+int32 UInstancedSplineMeshComponent::AddInstance(const FTransform& InstanceTransform, bool bWorldSpace)
+{
+	checkf( bValidAddFence, TEXT("Don't call AddInstance(const FTransform& InstanceTransform) on spline mesh components, call AddSplineInstance instead."));
+
+	return Super::AddInstance(InstanceTransform, bWorldSpace);
+}
+#endif
 
 void UInstancedSplineMeshComponent::ClearInstances()
 {

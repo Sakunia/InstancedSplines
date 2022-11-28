@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Components/SplineMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
+#include "Launch/Resources/Version.h"
 #include "InstancedSplineMeshComponent.generated.h"
 
 /* Default data that only lives on the CDO.*/
@@ -85,7 +86,12 @@ class INSTANCEDSPLINESCOMPONENT_API UInstancedSplineMeshComponent : public UInst
 	
 	/* Native add instance, 
 	 * Implemented a checkf with a fence to ensure the user calls the correct function to add instances. */
+#if ENGINE_MAJOR_VERSION == 4
 	virtual int32 AddInstance(const FTransform& InstanceTransform) override;
+#else
+	virtual int32 AddInstance(const FTransform& InstanceTransform, bool bWorldSpace = false) override;
+#endif
+	
 	virtual void ClearInstances() override;
 	/* Begin USceneComponent Interface */
 	
