@@ -18,7 +18,7 @@
 		{
 			"Name": "InstancedSplinesComponent",
 			"Type": "Runtime",
-			"LoadingPhase": "Default"
+			"LoadingPhase": "PreDefault"
 		}
 	]
 }

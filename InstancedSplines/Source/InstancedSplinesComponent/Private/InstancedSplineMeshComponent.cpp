@@ -1,8 +1,33 @@
 // Copyright Ben de Hullu & Coffee Stain Studios 2022. All Rights Reserved.
 
-
 #include "InstancedSplineMeshComponent.h"
 #include "Engine/StaticMesh.h"
+
+FSplineInstancedStaticMeshSceneProxy::FSplineInstancedStaticMeshSceneProxy(UInstancedStaticMeshComponent* InComponent, ERHIFeatureLevel::Type InFeatureLevel)
+	: FInstancedStaticMeshSceneProxy(InComponent,InFeatureLevel)
+{
+	bHasPerInstanceLocalBounds = true;
+	
+	// Force update bounds.
+	if (UseGPUScene(GetScene().GetShaderPlatform(), GetScene().GetFeatureLevel()))
+	{
+		if (auto Parent = Cast< UInstancedSplineMeshComponent>(InComponent))
+		{
+			const TArray<int32>& InstanceReorderTable = InComponent->InstanceReorderTable;
+			const FVector TranslatedSpaceOffset = -InComponent->GetTranslatedInstanceSpaceOrigin();
+			InstanceLocalBounds.Empty(InComponent->GetInstanceCount());
+			
+			for (int32 InstanceIndex = 0; InstanceIndex < InComponent->GetInstanceCount(); ++InstanceIndex)
+			{
+				const int32 RenderInstanceIndex = InstanceReorderTable.IsValidIndex(InstanceIndex) ? InstanceReorderTable[InstanceIndex] : InstanceIndex;
+				const auto& SplineSegment = Parent->SplineInstances[RenderInstanceIndex];
+
+				// TODO spline polish.
+				InstanceLocalBounds.Add( StaticMesh->GetBounds().GetBox().ExpandBy(10));
+			}
+		}
+	}
+}
 
 UInstancedSplineMeshComponent::UInstancedSplineMeshComponent()
 {
@@ -14,9 +39,20 @@ UInstancedSplineMeshComponent::UInstancedSplineMeshComponent()
 	 *	12		Length			// TODO read this from the X scale instead.
 	 *	13						// TODO make this a static bool in the shader instead. */
 	
-	NumCustomDataFloats = 14;
-
 	bRuntimeOnly = false;
+
+#if ENGINE_MAJOR_VERSION == 5
+	/* force disable nanite for now. */
+	bDisallowNanite = true;
+#endif
+
+	NumCustomDataFloats = 3 * 4;
+}
+
+void UInstancedSplineMeshComponent::BeginPlay()
+{	
+	Super::BeginPlay();
+	
 }
 
 FBoxSphereBounds UInstancedSplineMeshComponent::CalcBounds(const FTransform& BoundTransform) const
@@ -45,8 +81,61 @@ FBoxSphereBounds UInstancedSplineMeshComponent::CalcBounds(const FTransform& Bou
 			GetInstanceEndPos(i),
 			GetInstanceEndTangent(i) );
 	}
-	
+
+	RenderBounds.BoxExtent *= 1.25; // 25% upscale?
 	return RenderBounds;
+}
+
+FPrimitiveSceneProxy* UInstancedSplineMeshComponent::CreateSceneProxy()
+{
+	static const auto NaniteProxyRenderModeVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.Nanite.ProxyRenderMode"));
+	const int32 NaniteProxyRenderMode = (NaniteProxyRenderModeVar != nullptr) ? (NaniteProxyRenderModeVar->GetInt() != 0) : 0;
+
+	LLM_SCOPE(ELLMTag::InstancedMesh);
+
+	ProxySize = 0;
+
+	// Verify that the mesh is valid before using it.
+	const bool bMeshIsValid =
+		// make sure we have instances
+		PerInstanceSMData.Num() > 0 &&
+		// make sure we have an actual static mesh
+		GetStaticMesh() &&
+		GetStaticMesh()->IsCompiling() == false &&
+		GetStaticMesh()->HasValidRenderData();
+
+	if (bMeshIsValid)
+	{
+		check(InstancingRandomSeed != 0);
+		
+		// if instance data was modified, update GPU copy
+		// generally happens only in editor 
+		if (InstanceUpdateCmdBuffer.NumTotalCommands() != 0)
+		{
+			FlushInstanceUpdateCommands(true);
+		}
+		
+		ProxySize = PerInstanceRenderData->ResourceSize;
+
+		// Is Nanite supported, and is there built Nanite data for this static mesh?
+		if (ShouldCreateNaniteProxy())
+		{
+			checkf(false,TEXT("Not implemented"));
+			//return ::new Nanite::FSceneProxy(this);
+		}
+		// If we didn't get a proxy, but Nanite was enabled on the asset when it was built, evaluate proxy creation
+		else if (GetStaticMesh()->HasValidNaniteData() && NaniteProxyRenderMode != 0)
+		{
+			// Do not render Nanite proxy
+			return nullptr;
+		}
+		else
+		{
+			return ::new FSplineInstancedStaticMeshSceneProxy(this, GetWorld()->FeatureLevel);
+		}
+	}
+	
+	return nullptr;
 }
 
 FBoxSphereBounds UInstancedSplineMeshComponent::CalculateInstanceBounds(const FTransform& LocalToWorld, const FVector& Start, const FVector& StartTangent, const FVector& End, const FVector& EndTangent) const
@@ -140,42 +229,22 @@ FBoxSphereBounds UInstancedSplineMeshComponent::CalculateInstanceBounds(const FT
 
 FVector UInstancedSplineMeshComponent::GetInstanceStartPos(int32 Instance) const
 {
-	const int32 InstanceStartId = NumCustomDataFloats * Instance;
-	const float X = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.StartPositionPrimitiveDataStartIndex + 0 ];
-	const float Y = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.StartPositionPrimitiveDataStartIndex + 1 ];
-	const float Z = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.StartPositionPrimitiveDataStartIndex + 2 ];
-
-	return FVector(X,Y,Z);
+	return SplineInstances[Instance].StartPos;
 }
 
 FVector UInstancedSplineMeshComponent::GetInstanceStartTangent(int32 Instance) const
 {
-	const int32 InstanceStartId = NumCustomDataFloats * Instance;
-	const float X = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.StartTangentPrimitiveDataStartIndex + 0 ];
-	const float Y = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.StartTangentPrimitiveDataStartIndex + 1 ];
-	const float Z = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.StartTangentPrimitiveDataStartIndex + 2 ];
-	
-	return FVector( X, Y, Z);
+	return SplineInstances[Instance].StartTangent;
 }
 
 FVector UInstancedSplineMeshComponent::GetInstanceEndPos(int32 Instance) const
 {
-	const int32 InstanceStartId = NumCustomDataFloats * Instance;
-	const float X = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.EndPositionPrimitiveDataStartIndex + 0 ];
-	const float Y = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.EndPositionPrimitiveDataStartIndex + 1 ];
-	const float Z = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.EndPositionPrimitiveDataStartIndex + 2 ];
-    
-    return FVector( X, Y, Z);
+	return SplineInstances[Instance].EndPos;
 }
 
 FVector UInstancedSplineMeshComponent::GetInstanceEndTangent(int32 Instance) const
 {
-	const int32 InstanceStartId = NumCustomDataFloats * Instance;
-	const float X = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.EndTangentPrimitiveDataStartIndex + 0 ];
-	const float Y = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.EndTangentPrimitiveDataStartIndex + 1 ];
-	const float Z = PerInstanceSMCustomData[ InstanceStartId + NumPerInstancePrimitiveDataCountOffset + DefaultSplineShaderBindSettings.EndTangentPrimitiveDataStartIndex + 2 ];
-	
-	return FVector( X, Y, Z);
+	return SplineInstances[Instance].EndTangent;
 }
 
 static FVector SplineEvalPos(const FVector& StartPos, const FVector& StartTangent, const FVector& EndPos, const FVector& EndTangent, float A)
@@ -246,7 +315,11 @@ FTransform UInstancedSplineMeshComponent::CalcTransformInstance( const float Alp
 	return SliceTransform;
 }
 
+#if ENGINE_MAJOR_VERSION == 4
 int32 UInstancedSplineMeshComponent::AddInstance(const FTransform& InstanceTransform)
+#else
+int32 UInstancedSplineMeshComponent::AddInstance(const FTransform& InstanceTransform, bool bWorldSpace)
+#endif
 {
 	checkf( bValidAddFence, TEXT("Don't call AddInstance(const FTransform& InstanceTransform) on spline mesh components, call AddSplineInstance instead."));
 	
@@ -260,13 +333,24 @@ void UInstancedSplineMeshComponent::ClearInstances()
 	SplineInstances.Empty();
 }
 
-int32 UInstancedSplineMeshComponent::AddSplineInstance( const FVector StartPosition, const FVector StartTangent, const FVector EndPosition, const FVector EndTangent, const bool bMarkDirty)
+int32 UInstancedSplineMeshComponent::AddSplineInstance( const FVector StartPosition, const FVector StartTangent, const FVector EndPosition, const FVector EndTangent, bool bScaleLength, bool bRotateMesh, const bool bMarkDirty)
 {
 	// Fence to ensure we add the instance in the correct way.
 	SetAddFenceValid();
+
+	check(GetStaticMesh())
+	const float MeshLength = GetStaticMesh()->GetBounds().BoxExtent.X * 2;
 	
-	const int32 Index = AddInstance( FTransform::Identity );
-	SetupPerInstancePrimitiveData( Index, StartPosition, StartTangent, EndPosition, EndTangent );
+	// calculate direction
+	const float InstanceScale = bScaleLength ? FVector::Distance(StartPosition,EndPosition) / MeshLength : 1;
+	const FVector Dir = (EndPosition - StartPosition).GetSafeNormal();
+	const FQuat Rotation =  bRotateMesh ? FRotationMatrix::MakeFromXZ(Dir,SplineUpDirection).ToQuat() : FQuat::Identity;
+	const FTransform InstanceLocalTransform = FTransform( Rotation,StartPosition, FVector(InstanceScale,1,1) );
+	
+	// Instance location on spline.
+	const int32 Index = AddInstance( InstanceLocalTransform );
+
+	SetupPerInstancePrimitiveData( Index,StartPosition,StartTangent,EndPosition,EndTangent, InstanceScale );
 	
 	if ( bMarkDirty )
 	{
@@ -274,19 +358,26 @@ int32 UInstancedSplineMeshComponent::AddSplineInstance( const FVector StartPosit
 	}
 	
 	// Invalidate the fence again.
-	InvalidateAddFence();
-
-
+	InvalidateAddFence();	
+	
 	// add instance to array
 	if (!bRuntimeOnly)
 	{
 		SplineInstances.Add( FSplineMeshInstanceEntry(StartPosition, StartTangent, EndPosition, EndTangent) );
 	}
-	
+
 	return Index;
 }
 
-void UInstancedSplineMeshComponent::SetupPerInstancePrimitiveData(const int32 InstanceIndex, const FVector& StartPosition, const FVector StartTangent, const FVector& EndPosition, const FVector& EndTangent)
+#if WITH_EDITOR
+void UInstancedSplineMeshComponent::DrawDebugBounds()
+{
+	FBoxSphereBounds bounds = CalcBounds(GetOwner()->GetTransform());
+	DrawDebugBox(GetWorld(),bounds.Origin,bounds.BoxExtent,FColor::Red,true,10.f,1,5.f);
+}
+#endif
+
+void UInstancedSplineMeshComponent::SetupPerInstancePrimitiveData(const int32 InstanceIndex, const FVector& StartPosition, const FVector StartTangent, const FVector& EndPosition, const FVector& EndTangent, const float& InstanceScale)
 {
 	const int32 StartPosIds[ 3 ] = {
 		DefaultSplineShaderBindSettings.StartPositionPrimitiveDataStartIndex + NumPerInstancePrimitiveDataCountOffset + 0,
@@ -309,6 +400,7 @@ void UInstancedSplineMeshComponent::SetupPerInstancePrimitiveData(const int32 In
 		DefaultSplineShaderBindSettings.EndTangentPrimitiveDataStartIndex + NumPerInstancePrimitiveDataCountOffset + 2 };
 
 	// Start pos
+	
 	SetCustomDataValue( InstanceIndex,StartPosIds[0], StartPosition.X,false);
 	SetCustomDataValue( InstanceIndex,StartPosIds[1], StartPosition.Y,false);
 	SetCustomDataValue( InstanceIndex,StartPosIds[2], StartPosition.Z,false);
@@ -327,6 +419,12 @@ void UInstancedSplineMeshComponent::SetupPerInstancePrimitiveData(const int32 In
 	SetCustomDataValue( InstanceIndex,EndTangentIds[0], EndTangent.X,false);
 	SetCustomDataValue( InstanceIndex,EndTangentIds[1], EndTangent.Y,false);
 	SetCustomDataValue( InstanceIndex,EndTangentIds[2], EndTangent.Z,false);
+
+	// Set instance length.
+	if (DefaultSplineShaderBindSettings.InstanceScaleIndex != INDEX_NONE)
+	{
+		SetCustomDataValue( InstanceIndex,DefaultSplineShaderBindSettings.InstanceScaleIndex + NumPerInstancePrimitiveDataCountOffset, InstanceScale,false);
+	}
 }
 
 FVector UInstancedSplineMeshComponent::GetAxisMask(ESplineMeshAxis::Type InAxis)
@@ -344,3 +442,28 @@ FVector UInstancedSplineMeshComponent::GetAxisMask(ESplineMeshAxis::Type InAxis)
 		return FVector::ZeroVector;
 	}
 }
+
+#if 0
+FPerInstanceSplineEntryRenderData::FPerInstanceSplineEntryRenderData(FStaticMeshInstanceData& Other, ERHIFeatureLevel::Type InFeaureLevel, bool InRequireCPUAccess, FBox InBounds, bool bTrack, bool bDeferGPUUploadIn)
+	: ResourceSize(InRequireCPUAccess ? Other.GetResourceSize() : 0)
+	, InstanceBuffer(InFeaureLevel, InRequireCPUAccess, bDeferGPUUploadIn)
+	, InstanceLocalBounds(InBounds)
+	, bTrackBounds(bTrack)
+	, bBoundsTransformsDirty(true)
+{
+	InstanceBuffer.InitFromPreallocatedData(Other);
+	InstanceBuffer_GameThread = InstanceBuffer.InstanceData;
+	if (!InstanceBuffer.CondSetFlushToGPUPending())
+	{
+		BeginInitResource(&InstanceBuffer);
+	}
+	UpdateBoundsTransforms_Concurrent();
+}
+
+FPerInstanceSplineEntryRenderData::~FPerInstanceSplineEntryRenderData()
+{
+	InstanceBuffer_GameThread.Reset();
+	// Should be always destructed on rendering thread
+	InstanceBuffer.ReleaseResource();
+}
+#endif
